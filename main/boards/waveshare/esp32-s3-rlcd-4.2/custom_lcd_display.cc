@@ -1,5 +1,6 @@
 #include <vector>
 #include <cstring>
+#include <ctime>
 #include <freertos/FreeRTOS.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_log.h>
@@ -11,6 +12,13 @@
 #include "settings.h"
 #include "config.h"
 #include "board.h"
+
+// BUILTIN_TEXT_FONT 由 CMake 定义（RLCD 板为 font_noto_sans_basic_14_1），保证被编译进来
+LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
+
+// 星期名称（中文）
+static const char* kWeekdays[] = {"星期日", "星期一", "星期二", "星期三",
+                                  "星期四", "星期五", "星期六"};
 
 void CustomLcdDisplay::Lvgl_flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * color_p)
 {
@@ -334,5 +342,148 @@ void CustomLcdDisplay::RLCD_Display() {
 
   	RLCD_SendCommand(0x2c);     // Page Address Set
 
-	RLCD_Sendbuffera(DispBuffer,DisplayLen);
+  	RLCD_Sendbuffera(DispBuffer,DisplayLen);
 }
+
+// ===================== 待机仪表盘实现 =====================
+
+void CustomLcdDisplay::SetupDashboard() {
+    // 仪表盘根容器：覆盖整个屏幕，置于所有聊天 UI 之上
+    // 用 screen 作为父对象，默认隐藏，待机时才显示
+    auto screen = lv_screen_active();
+    dashboard_root_ = lv_obj_create(screen);
+    // 覆盖整个屏幕，无边框无内边距
+    lv_obj_set_size(dashboard_root_, width_, height_);
+    lv_obj_set_pos(dashboard_root_, 0, 0);
+    lv_obj_set_style_bg_opa(dashboard_root_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(dashboard_root_, 0, 0);
+    lv_obj_set_style_pad_all(dashboard_root_, 0, 0);
+    lv_obj_set_style_radius(dashboard_root_, 0, 0);
+    lv_obj_set_scrollbar_mode(dashboard_root_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(dashboard_root_, LV_OBJ_FLAG_SCROLLABLE);
+    // 置顶（覆盖在聊天内容之上）
+    lv_obj_move_foreground(dashboard_root_);
+
+    // 左侧日历区（约 60% 宽度）—— 日期放大显示
+    date_label_ = lv_label_create(dashboard_root_);
+    lv_obj_set_style_text_font(date_label_, &BUILTIN_TEXT_FONT, 0);
+    lv_obj_set_style_transform_scale(date_label_, 256 * 2, 0);  // 放大 2 倍
+    lv_obj_align(date_label_, LV_ALIGN_LEFT_MID, 25, -40);
+    lv_label_set_text(date_label_, "2026/01/01");
+
+    weekday_label_ = lv_label_create(dashboard_root_);
+    lv_obj_set_style_text_font(weekday_label_, &BUILTIN_TEXT_FONT, 0);
+    lv_obj_set_style_transform_scale(weekday_label_, 256 * 2, 0);
+    lv_obj_align(weekday_label_, LV_ALIGN_LEFT_MID, 25, 15);
+    lv_label_set_text(weekday_label_, "星期一");
+
+    // 右上：时钟（放大显示）
+    clock_label_ = lv_label_create(dashboard_root_);
+    lv_obj_set_style_text_font(clock_label_, &BUILTIN_TEXT_FONT, 0);
+    lv_obj_set_style_transform_scale(clock_label_, 256 * 3, 0);  // 放大 3 倍
+    lv_obj_align(clock_label_, LV_ALIGN_TOP_RIGHT, -20, 55);
+    lv_label_set_text(clock_label_, "00:00");
+
+    // 右下：天气（温度+文字，第 2 步接真实数据）
+    weather_label_ = lv_label_create(dashboard_root_);
+    lv_obj_set_style_text_font(weather_label_, &BUILTIN_TEXT_FONT, 0);
+    lv_obj_set_style_transform_scale(weather_label_, 256 * 2, 0);
+    lv_obj_align(weather_label_, LV_ALIGN_BOTTOM_RIGHT, -20, -50);
+    lv_label_set_text(weather_label_, "--°");
+
+    // 右下：城市名（小字，不放大）
+    city_label_ = lv_label_create(dashboard_root_);
+    lv_obj_set_style_text_font(city_label_, &BUILTIN_TEXT_FONT, 0);
+    lv_obj_align(city_label_, LV_ALIGN_BOTTOM_RIGHT, -20, -15);
+    lv_label_set_text(city_label_, "定位中...");
+
+    // 创建每秒刷新时钟的定时器
+    esp_timer_create_args_t clock_timer_args = {
+        .callback = ClockTimerCallback,
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "dash_clock",
+        .skip_unhandled_events = true,
+    };
+    esp_timer_create(&clock_timer_args, &clock_timer_);
+
+    // 默认先隐藏，等进入待机状态时显示
+    HideDashboard();
+
+    // 立即刷新一次时钟显示
+    RefreshClock();
+}
+
+void CustomLcdDisplay::ClockTimerCallback(void* arg) {
+    auto* self = static_cast<CustomLcdDisplay*>(arg);
+    self->RefreshClock();
+}
+
+void CustomLcdDisplay::RefreshClock() {
+    if (clock_label_ == nullptr) return;
+
+    // 小智激活时已把本地时间写入系统（见 ota.cc 的 settimeofday）
+    // 因此系统时间即为本地时间，直接用 gmtime_r 读取
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    gmtime_r(&now, &timeinfo);
+
+    char time_buf[16];
+    char date_buf[16];
+    snprintf(time_buf, sizeof(time_buf), "%02d:%02d",
+             timeinfo.tm_hour, timeinfo.tm_min);
+    snprintf(date_buf, sizeof(date_buf), "%04d/%02d/%02d",
+             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+
+    DisplayLockGuard lock(this);
+    if (clock_label_ != nullptr) {
+        lv_label_set_text(clock_label_, time_buf);
+    }
+    if (date_label_ != nullptr) {
+        lv_label_set_text(date_label_, date_buf);
+    }
+    if (weekday_label_ != nullptr && timeinfo.tm_wday >= 0 && timeinfo.tm_wday <= 6) {
+        lv_label_set_text(weekday_label_, kWeekdays[timeinfo.tm_wday]);
+    }
+}
+
+void CustomLcdDisplay::ShowDashboard() {
+    if (dashboard_root_ == nullptr) return;
+    DisplayLockGuard lock(this);
+    lv_obj_remove_flag(dashboard_root_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(dashboard_root_);
+    // 启动时钟定时器（每秒刷新）
+    if (clock_timer_ != nullptr) {
+        esp_timer_start_periodic(clock_timer_, 1000000);
+    }
+    RefreshClock();
+}
+
+void CustomLcdDisplay::HideDashboard() {
+    if (dashboard_root_ == nullptr) return;
+    DisplayLockGuard lock(this);
+    lv_obj_add_flag(dashboard_root_, LV_OBJ_FLAG_HIDDEN);
+    // 停止时钟定时器（节省 CPU）
+    if (clock_timer_ != nullptr) {
+        esp_timer_stop(clock_timer_);
+    }
+}
+
+void CustomLcdDisplay::SetupUI() {
+    // 先调用基类 SetupUI 完成标准聊天界面的创建
+    LcdDisplay::SetupUI();
+    // 在标准 UI 之上叠加仪表盘
+    SetupDashboard();
+}
+
+void CustomLcdDisplay::SetStatus(const char* status) {
+    // 先调用基类处理状态文字显示
+    LcdDisplay::SetStatus(status);
+    // 感知待机切换：收到 STANDBY 显示仪表盘，其他状态隐藏
+    if (strcmp(status, Lang::Strings::STANDBY) == 0) {
+        ShowDashboard();
+    } else {
+        HideDashboard();
+    }
+}
+
