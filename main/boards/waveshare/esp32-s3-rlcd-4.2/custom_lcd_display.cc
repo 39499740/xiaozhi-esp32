@@ -428,12 +428,11 @@ void CustomLcdDisplay::RefreshClock() {
     struct tm timeinfo;
     gmtime_r(&now, &timeinfo);
 
+    // 用 strftime 格式化，避免 snprintf 对 int 形参触发 -Wformat-truncation。
     char time_buf[16];
     char date_buf[16];
-    snprintf(time_buf, sizeof(time_buf), "%02d:%02d",
-             timeinfo.tm_hour, timeinfo.tm_min);
-    snprintf(date_buf, sizeof(date_buf), "%04d/%02d/%02d",
-             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+    strftime(time_buf, sizeof(time_buf), "%H:%M", &timeinfo);
+    strftime(date_buf, sizeof(date_buf), "%Y/%m/%d", &timeinfo);
 
     DisplayLockGuard lock(this);
     if (clock_label_ != nullptr) {
