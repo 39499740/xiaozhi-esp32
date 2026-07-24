@@ -47,6 +47,14 @@ target_compile_definitions(lvgl PRIVATE
 # SDL2 include 路径传给 lvgl(内置 SDL 驱动需要 SDL.h)
 target_include_directories(lvgl PRIVATE ${SDL2_INCLUDE_DIRS})
 
+# 修正 LVGL 9.5 桌面构建的一个坑:os_desktop.cmake 无条件 glob 了所有 .S 文件,
+# 包括 Cortex-M 专用的 helium 汇编(src/draw/sw/blend/helium/lv_blend_helium.S)。
+# 在 Apple Silicon 上这个 .S 会被 clang 当汇编编译,指令不被 macOS arm64 识别,导致整个构建崩溃。
+# helium 只对 ARM Cortex-M (MVE) 有用,桌面平台不需要,从 lvgl 源里剔除。
+get_target_property(_lvgl_sources lvgl SOURCES)
+list(FILTER _lvgl_sources EXCLUDE REGEX "/helium/lv_blend_helium\\.S$")
+set_target_properties(lvgl PROPERTIES SOURCES "${_lvgl_sources}")
+
 target_link_libraries(dashboard_preview PRIVATE
     lvgl
     ${SDL2_LIBRARIES}
