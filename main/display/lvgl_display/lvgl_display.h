@@ -45,6 +45,7 @@ protected:
     lv_obj_t* low_battery_label_ = nullptr;
 
     const char* battery_icon_ = nullptr;
+    int battery_level_ = -1;
     const char* network_icon_ = nullptr;
     bool muted_ = false;
 

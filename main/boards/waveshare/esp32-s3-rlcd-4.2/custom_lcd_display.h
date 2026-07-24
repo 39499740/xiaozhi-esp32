@@ -3,6 +3,10 @@
 
 #include <driver/gpio.h>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <atomic>
+#include <mutex>
 #include <string>
 #include "lcd_display.h"
 #include "dashboard_layout.h"
@@ -49,10 +53,39 @@ private:
     // ---- 待机仪表盘 ----
     DashboardState dashboard_state_;        // 布局状态（共享给 dashboard_layout）
     esp_timer_handle_t clock_timer_ = nullptr;  // ESP 专属：1 秒刷新时钟
+    TaskHandle_t holiday_task_ = nullptr;       // 后台查询年度调休日历
+    std::atomic_bool holiday_task_running_{false};
+    std::atomic_bool holiday_task_stop_{false};
+    std::mutex holiday_mutex_;
+    int pending_holiday_year_ = 0;
+    std::string pending_holiday_flags_;
+    bool pending_holiday_ready_ = false;
+    std::string pending_weather_city_;
+    std::string pending_weather_temperature_;
+    std::string pending_weather_feels_like_;
+    std::string pending_weather_high_temperature_;
+    std::string pending_weather_low_temperature_;
+    std::string pending_weather_description_;
+    bool pending_weather_ready_ = false;
+    std::string pending_weather_city_only_;
+    bool pending_weather_city_only_ready_ = false;
+    std::string weather_location_;
+    std::string weather_city_;
+    bool weather_location_manual_ = false;
+    bool weather_location_ready_ = false;
+    lv_obj_t* battery_percent_label_ = nullptr;
+    int displayed_battery_percent_ = -1;
     void SetupDashboard();
     static void ClockTimerCallback(void* arg);
+    static void HolidayCalendarTask(void* arg);
+    bool FetchHolidayCalendar();
+    bool ResolveWeatherLocation();
+    bool FetchWeather();
+    void ApplyPendingDashboardData();
+    void StopHolidayCalendarTask();
     void ShowDashboard();
     void HideDashboard();
+    void HideDefaultEmotion();
 
 public:
     CustomLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
@@ -67,6 +100,8 @@ public:
     // 重写：SetupUI 完成后挂上仪表盘；SetStatus 用来感知待机切换
     virtual void SetupUI() override;
     virtual void SetStatus(const char* status) override;
+    virtual void SetEmotion(const char* emotion) override;
+    virtual void UpdateStatusBar(bool update_all = false) override;
 };
 
 #endif

@@ -590,6 +590,34 @@ choice BOARD_TYPE
         depends on IDF_TARGET_ESP32S3
 endchoice
 
+menu "RLCD Dashboard Weather"
+    depends on BOARD_TYPE_WAVESHARE_ESP32_S3_RLCD_4_2
+
+    config RLCD_QWEATHER_API_HOST
+        string "QWeather API Host"
+        default "api.qweather.com"
+        help
+            QWeather API host without https://. Use your own API host when available.
+
+    config RLCD_QWEATHER_API_KEY
+        string "QWeather API Key"
+        default ""
+        help
+            QWeather API key sent in the X-QW-Api-Key header. Leave empty to disable weather queries.
+
+    config RLCD_QWEATHER_LOCATION
+        string "QWeather Location ID"
+        default ""
+        help
+            Optional fixed QWeather Location ID or longitude,latitude pair. Leave empty to resolve the city from the public network IP; this can identify the carrier or NAT gateway rather than the device's physical city.
+
+    config RLCD_QWEATHER_CITY
+        string "Weather city display name"
+        default ""
+        help
+            Optional display-name override. Leave empty to use the city resolved from the network IP.
+endmenu
+
 choice XIAOZHI_NETWORK_TYPE
     prompt "Network Type"
     depends on BOARD_TYPE_WAVESHARE_ESP32_P4_NANO

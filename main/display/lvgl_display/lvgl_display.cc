@@ -234,6 +234,7 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
     bool charging, discharging;
     const char* icon = nullptr;
     if (board.GetBatteryLevel(battery_level, charging, discharging)) {
+        battery_level_ = battery_level < 0 ? 0 : (battery_level > 100 ? 100 : battery_level);
         if (charging) {
             icon = MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_BOLT;
         } else {

@@ -888,6 +888,12 @@ else()
 endif()
 list(APPEND SOURCES ${BOARD_SOURCES})
 
+# The RLCD dashboard has a dedicated common Chinese font so IP-resolved city
+# names and calendar/weather labels do not depend on the small basic font.
+if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_RLCD_4_2)
+    list(APPEND SOURCES "boards/waveshare/esp32-s3-rlcd-4.2/dashboard_assets/rlcd_chinese_20_1.c")
+endif()
+
 # Select one audio engine for each chip family
 if(CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4)
     list(APPEND SOURCES "audio/engines/afe_audio_engine.cc")
