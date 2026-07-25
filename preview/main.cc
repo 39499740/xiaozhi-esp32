@@ -4,6 +4,7 @@
 #include <lvgl.h>
 #include <cstdlib>
 #include <cstdio>
+#include <ctime>
 #include <material_symbols.h>
 #include "dashboard_layout.h"
 
@@ -16,10 +17,22 @@ static const int WIN_H = 300;
 
 static DashboardState g_state;
 static lv_timer_t* g_clock_timer = nullptr;
+static lv_obj_t* g_preview_status_label = nullptr;
+
+static void RefreshPreviewStatus() {
+    if (g_preview_status_label == nullptr) return;
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    char time_buf[16];
+    strftime(time_buf, sizeof(time_buf), "%H:%M", &timeinfo);
+    lv_label_set_text(g_preview_status_label, time_buf);
+}
 
 static void clock_timer_cb(lv_timer_t* t) {
     LV_UNUSED(t);
     dashboard_layout::Refresh(g_state);
+    RefreshPreviewStatus();
 }
 
 static void SetupPreviewTopBar(lv_obj_t* screen) {
@@ -67,6 +80,20 @@ static void SetupPreviewTopBar(lv_obj_t* screen) {
     lv_obj_set_style_text_font(battery_percent, &font_noto_sans_basic_30_4, 0);
     lv_obj_set_style_text_color(battery_percent, lv_color_black(), 0);
     lv_obj_set_style_margin_left(battery_percent, 2, 0);
+
+    // The device status bar overlays the top row with the current time. Keep
+    // the same visual cue in the simulator so the dashboard no longer needs a
+    // duplicate clock in its upper-right panel.
+    g_preview_status_label = lv_label_create(screen);
+    lv_obj_set_size(g_preview_status_label, 120, 30);
+    lv_obj_set_style_text_font(g_preview_status_label, &font_noto_sans_basic_30_4, 0);
+    lv_obj_set_style_text_color(g_preview_status_label, lv_color_black(), 0);
+    lv_obj_set_style_text_align(g_preview_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_bg_opa(g_preview_status_label, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(g_preview_status_label, 0, 0);
+    lv_obj_set_style_pad_all(g_preview_status_label, 0, 0);
+    lv_obj_align(g_preview_status_label, LV_ALIGN_TOP_MID, 0, 4);
+    RefreshPreviewStatus();
 }
 
 int main(int argc, char** argv) {
@@ -98,9 +125,11 @@ int main(int argc, char** argv) {
     // 城市通过环境变量注入，默认不再假定任何位置：
     //   RLCD_PREVIEW_CITY=济南 ./dashboard_preview
     const char* preview_city = std::getenv("RLCD_PREVIEW_CITY");
+    // 预警和分钟级降水也可通过环境变量注入，使用换行分隔两行：
+    //   RLCD_PREVIEW_NOTICE=$'预警 雷电黄色预警\n5分钟后可能有降水' ./dashboard_preview
+    const char* preview_notice = std::getenv("RLCD_PREVIEW_NOTICE");
     dashboard_layout::SetWeather(g_state, preview_city != nullptr ? preview_city : "定位中", "27 C", "29℃",
-                                 "31℃", "23℃", "阴");
-
+                                 "31℃", "23℃", "阴", preview_notice != nullptr ? preview_notice : "");
     printf("Preview running. Close window to quit.\n");
 
     // LVGL 9.5 主循环:SDL 驱动内部处理事件,只需调 lv_timer_handler

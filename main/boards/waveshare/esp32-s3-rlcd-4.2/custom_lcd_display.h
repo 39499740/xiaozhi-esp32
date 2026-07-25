@@ -60,17 +60,29 @@ private:
     int pending_holiday_year_ = 0;
     std::string pending_holiday_flags_;
     bool pending_holiday_ready_ = false;
+    int pending_holiday_note_year_ = 0;
+    int pending_holiday_note_day_of_year_ = 0;
+    std::string pending_holiday_note_;
+    bool pending_holiday_note_ready_ = false;
     std::string pending_weather_city_;
     std::string pending_weather_temperature_;
     std::string pending_weather_feels_like_;
     std::string pending_weather_high_temperature_;
     std::string pending_weather_low_temperature_;
     std::string pending_weather_description_;
+    std::string pending_weather_notice_;
     bool pending_weather_ready_ = false;
     std::string pending_weather_city_only_;
     bool pending_weather_city_only_ready_ = false;
     std::string weather_location_;
     std::string weather_city_;
+    // QWeather's minutely and alert endpoints require coordinates. Keep the
+    // resolved longitude,latitude pair separately from the city Location ID.
+    std::string weather_coordinates_;
+    std::string weather_precipitation_notice_;
+    std::string weather_alert_notice_;
+    std::string weather_notice_;
+    std::atomic_bool weather_location_refresh_requested_{false};
     bool weather_location_manual_ = false;
     bool weather_location_ready_ = false;
     lv_obj_t* battery_percent_label_ = nullptr;
@@ -81,6 +93,7 @@ private:
     bool FetchHolidayCalendar();
     bool ResolveWeatherLocation();
     bool FetchWeather();
+    bool FetchWeatherNotices();
     void ApplyPendingDashboardData();
     void StopHolidayCalendarTask();
     void ShowDashboard();
@@ -102,6 +115,10 @@ public:
     virtual void SetStatus(const char* status) override;
     virtual void SetEmotion(const char* emotion) override;
     virtual void UpdateStatusBar(bool update_all = false) override;
+
+    // Called by the device MCP tool after the user asks the assistant to
+    // update the weather location. The worker performs all network I/O.
+    bool RequestWeatherLocationUpdate();
 };
 
 #endif

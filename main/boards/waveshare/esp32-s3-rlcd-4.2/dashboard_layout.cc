@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <string>
 
 // 仪表盘使用专用的常用汉字字库，覆盖日历、天气以及常见城市名。
 // 该字库为 1bpp，适合 RLCD 黑白显示，同时避免把 4bpp 全字库带进固件。
@@ -28,19 +29,23 @@ constexpr int kTopBarHeight = 38;
 constexpr int kCalendarTitleY = 40;
 constexpr int kCalendarWeekdayY = 73;
 constexpr int kCalendarDaysY = 99;
-constexpr int kCalendarCellHeight = 25;
-constexpr int kCalendarLegendY = 265;
+// Keep the row step and the inverted cell height separate.  A full-height
+// black label makes consecutive weekend/holiday rows visually touch even
+// when the row positions are farther apart.
+constexpr int kCalendarRowStep = 29;
+constexpr int kCalendarCellHeight = 24;
+constexpr int kCalendarLegendY = 270;
 constexpr int kRightPanelX = 242;
 constexpr int kRightPanelWidth = 150;
-constexpr int kClockCaptionY = 40;
-constexpr int kClockY = 62;
-constexpr int kClockDividerY = 108;
-constexpr int kWeatherCaptionY = 114;
-constexpr int kWeatherY = 138;
-constexpr int kWeatherDescriptionY = 174;
-constexpr int kWeatherFeelsLikeY = 200;
-constexpr int kWeatherRangeY = 226;
-constexpr int kCityY = 252;
+// The shared LCD top/status bar already owns the current time.  Use the whole
+// dashboard panel for weather details instead of rendering a second clock.
+constexpr int kCityY = 40;
+constexpr int kWeatherY = 64;
+constexpr int kWeatherDescriptionY = 101;
+constexpr int kWeatherFeelsLikeY = 126;
+constexpr int kWeatherRangeY = 151;
+constexpr int kWeatherAlertY = 176;
+constexpr int kWeatherPrecipitationY = 200;
 
 const char* kCalendarWeekdays[] = {"日", "一", "二", "三", "四", "五", "六"};
 
@@ -73,6 +78,15 @@ lv_obj_t* CreateRule(lv_obj_t* parent, int x, int y, int width, int height) {
     lv_obj_set_style_pad_all(rule, 0, 0);
     lv_obj_clear_flag(rule, LV_OBJ_FLAG_SCROLLABLE);
     return rule;
+}
+
+lv_obj_t* CreateScrollingLabel(lv_obj_t* parent, const lv_font_t* font, int x, int y, int width, int height) {
+    lv_obj_t* label = CreateTextLabel(parent, font, x, y, width, height, 256);
+    // Keep each notice on one line. LVGL starts a circular horizontal marquee
+    // only when the text is wider than the label, so short notices remain still.
+    lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, 0);
+    return label;
 }
 
 int DaysInMonth(int year, int month) {
@@ -181,41 +195,39 @@ void Setup(DashboardState& s, lv_obj_t* parent, int width, int height, const lv_
         const int column = index % kCalendarColumns;
         const int row = index / kCalendarColumns;
         s.calendar_days[index] = CreateTextLabel(
-            s.root, chinese_font, kCalendarX + column * kCalendarCellWidth, kCalendarDaysY + row * kCalendarCellHeight,
+            s.root, chinese_font, kCalendarX + column * kCalendarCellWidth, kCalendarDaysY + row * kCalendarRowStep,
             kCalendarCellWidth, kCalendarCellHeight, 256);
         lv_label_set_text(s.calendar_days[index], "");
     }
     s.calendar_legend = CreateTextLabel(s.root, chinese_font, kCalendarX, kCalendarLegendY, kCalendarWidth, 30, 256);
-    lv_label_set_text(s.calendar_legend, "周末/节日");
+    lv_label_set_text(s.calendar_legend, "今天：工作日");
 
     // 中间分隔线，避免日历和右侧信息互相抢空间。
     CreateRule(s.root, 234, kTopBarHeight, 1, 254);
 
-    // 右上：电子表。
-    s.clock_caption = CreateTextLabel(s.root, chinese_font, kRightPanelX, kClockCaptionY, kRightPanelWidth, 26, 256);
-    lv_label_set_text(s.clock_caption, "时间");
-    s.clock_label = CreateTextLabel(s.root, font, kRightPanelX, kClockY, kRightPanelWidth, 42, 256);
-    lv_label_set_text(s.clock_label, "00:00");
-    CreateRule(s.root, kRightPanelX, kClockDividerY, kRightPanelWidth, 1);
-
-    // 右下：天气卡片。当前温度使用大号数字，其余信息按重要性从上到下排列。
-    s.weather_caption = CreateTextLabel(s.root, chinese_font, kRightPanelX, kWeatherCaptionY, kRightPanelWidth, 26, 256);
-    lv_label_set_text(s.weather_caption, "天气");
+    // 右侧：天气卡片。时间已经由共享 top/status bar 显示，释放出的区域留给
+    // 分钟级降水和官方天气预警；没有需要提醒的内容时保持空白。
+    s.city_label = CreateTextLabel(s.root, chinese_font, kRightPanelX, kCityY, kRightPanelWidth, 24, 256);
+    lv_label_set_text(s.city_label, "定位中");
     s.weather_label = CreateTextLabel(s.root, font, kRightPanelX, kWeatherY, kRightPanelWidth, 36, 256);
     lv_label_set_text(s.weather_label, "-- C");
-    s.weather_desc_label = CreateTextLabel(s.root, chinese_font, kRightPanelX, kWeatherDescriptionY, kRightPanelWidth, 26, 256);
+    s.weather_desc_label = CreateTextLabel(s.root, chinese_font, kRightPanelX, kWeatherDescriptionY, kRightPanelWidth, 24, 256);
     lv_label_set_text(s.weather_desc_label, "定位中");
-    s.weather_feels_like_label = CreateTextLabel(s.root, chinese_font, kRightPanelX, kWeatherFeelsLikeY, kRightPanelWidth, 26, 256);
+    s.weather_feels_like_label = CreateTextLabel(s.root, chinese_font, kRightPanelX, kWeatherFeelsLikeY, kRightPanelWidth, 24, 256);
     lv_label_set_text(s.weather_feels_like_label, "体感 --℃");
-    s.weather_range_label = CreateTextLabel(s.root, chinese_font, kRightPanelX, kWeatherRangeY, kRightPanelWidth, 26, 256);
+    s.weather_range_label = CreateTextLabel(s.root, chinese_font, kRightPanelX, kWeatherRangeY, kRightPanelWidth, 24, 256);
     lv_label_set_text(s.weather_range_label, "--℃～--℃");
-    s.city_label = CreateTextLabel(s.root, chinese_font, kRightPanelX, kCityY, kRightPanelWidth, 26, 256);
-    lv_label_set_text(s.city_label, "定位中");
+    s.weather_alert_label = CreateScrollingLabel(s.root, chinese_font, kRightPanelX, kWeatherAlertY,
+                                                 kRightPanelWidth, 24);
+    lv_label_set_text(s.weather_alert_label, "");
+    s.weather_precipitation_label = CreateScrollingLabel(s.root, chinese_font, kRightPanelX,
+                                                        kWeatherPrecipitationY, kRightPanelWidth, 24);
+    lv_label_set_text(s.weather_precipitation_label, "");
 
     // 默认先隐藏，等进入待机状态时显示
     Hide(s);
 
-    // 立即刷新一次时钟显示
+    // 立即刷新一次日历显示
     Refresh(s);
 }
 
@@ -227,18 +239,13 @@ void Refresh(DashboardState& s) {
     // 用 localtime_r（预览和固件都适用：固件因 ota.cc 已写入本地时间，localtime_r 返回本地时间）
     localtime_r(&now, &timeinfo);
 
-    char time_buf[16];
     char month_buf[32];
-    strftime(time_buf, sizeof(time_buf), "%H:%M", &timeinfo);
     const int year = timeinfo.tm_year + 1900;
     const int month = timeinfo.tm_mon + 1;
     const int today = timeinfo.tm_mday;
     const int first_weekday = WeekdayOfDate(year, month, 1);
     const int days = DaysInMonth(year, month);
 
-    if (s.clock_label != nullptr) {
-        lv_label_set_text(s.clock_label, time_buf);
-    }
     if (s.calendar_title != nullptr) {
         std::snprintf(month_buf, sizeof(month_buf), "%04d年%02d月", year, month);
         lv_label_set_text(s.calendar_title, month_buf);
@@ -261,11 +268,32 @@ void Refresh(DashboardState& s) {
         SetDayStyle(s.calendar_days[index], day_off);
         SetTodayStyle(s.calendar_days[index], day == today, day_off);
     }
+
+    if (s.calendar_legend != nullptr) {
+        const int weekday = timeinfo.tm_wday;
+        const int day_of_year = timeinfo.tm_yday + 1;
+        const bool note_matches_today = s.holiday_note_ready && s.holiday_note_year == year &&
+                                         s.holiday_note_day_of_year == day_of_year;
+        char note_buf[96];
+        if (note_matches_today && s.holiday_note[0] != '\0') {
+            std::snprintf(note_buf, sizeof(note_buf), "今天：%s", s.holiday_note);
+        } else if (IsDayOff(s, year, month, today, weekday)) {
+            if (weekday == 0 || weekday == 6) {
+                std::snprintf(note_buf, sizeof(note_buf), "今天：周%s", kCalendarWeekdays[weekday]);
+            } else {
+                std::snprintf(note_buf, sizeof(note_buf), "今天：休息日");
+            }
+        } else {
+            std::snprintf(note_buf, sizeof(note_buf), "今天：工作日");
+        }
+        lv_label_set_text(s.calendar_legend, note_buf);
+    }
 }
 
 void SetWeather(DashboardState& s, const char* city, const char* temperature,
                 const char* feels_like, const char* high_temperature,
-                const char* low_temperature, const char* description) {
+                const char* low_temperature, const char* description,
+                const char* notice) {
     if (s.city_label != nullptr) {
         lv_label_set_text(s.city_label, city != nullptr ? city : "定位中");
     }
@@ -289,6 +317,19 @@ void SetWeather(DashboardState& s, const char* city, const char* temperature,
                       high_temperature != nullptr ? high_temperature : "--℃");
         lv_label_set_text(s.weather_range_label, range_buf);
     }
+    const char* notice_text = notice != nullptr ? notice : "";
+    const char* separator = std::strchr(notice_text, '\n');
+    if (separator == nullptr) {
+        if (s.weather_alert_label != nullptr) lv_label_set_text(s.weather_alert_label, notice_text);
+        if (s.weather_precipitation_label != nullptr) lv_label_set_text(s.weather_precipitation_label, "");
+    } else {
+        const std::string alert_text(notice_text, static_cast<size_t>(separator - notice_text));
+        const std::string precipitation_text(separator + 1);
+        if (s.weather_alert_label != nullptr) lv_label_set_text(s.weather_alert_label, alert_text.c_str());
+        if (s.weather_precipitation_label != nullptr) {
+            lv_label_set_text(s.weather_precipitation_label, precipitation_text.c_str());
+        }
+    }
 }
 
 void SetWeatherCity(DashboardState& s, const char* city) {
@@ -310,6 +351,15 @@ bool SetHolidayCalendar(DashboardState& s, int year, const char* workday_flags, 
     s.holiday_calendar_year = year;
     s.holiday_calendar_length = length;
     s.holiday_calendar_ready = true;
+    return true;
+}
+
+bool SetHolidayNote(DashboardState& s, int year, int day_of_year, const char* note) {
+    if (year < 1970 || day_of_year < 1 || day_of_year > 366) return false;
+    std::snprintf(s.holiday_note, sizeof(s.holiday_note), "%s", note != nullptr ? note : "");
+    s.holiday_note_year = year;
+    s.holiday_note_day_of_year = day_of_year;
+    s.holiday_note_ready = true;
     return true;
 }
 

@@ -19,7 +19,7 @@ class CustomBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
     Button boot_button_;
-    CustomLcdDisplay *display_;
+    CustomLcdDisplay *display_ = nullptr;
     adc_oneshot_unit_handle_t adc1_handle;
     adc_cali_handle_t cali_handle;
     bool vbat_status = 0;
@@ -64,6 +64,14 @@ private:
             EnterWifiConfigMode();
             return true;
         });
+        mcp_server.AddTool(
+            "self.disp.update_location",
+            "更新天气地理位置。用户说‘更新位置’、‘重新定位天气’或表示设备移动到了新城市时调用；"
+            "设备会重新查询当前公网 IP 对应的城市，并立即刷新天气。不要周期性调用。",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                return display_ != nullptr && display_->RequestWeatherLocationUpdate();
+            });
     }
 
     void InitializeLcdDisplay() {
@@ -165,6 +173,7 @@ public:
 
         return true;
     }
+
 };
 
 DECLARE_BOARD(CustomBoard);

@@ -31,20 +31,25 @@ namespace {
 // 纯文本 HTTP 响应。内容只接受严格的年度 0/1 位图校验，因此使用 HTTP
 // 可以避免设备每次启动都触发无效 TLS 握手，同时保留调休日历功能。
 constexpr char kHolidayCalendarUrl[] = "http://chinese-workday-calendar.aops.io/years.properties";
+// 该 MIT 数据集提供国务院公布的节假日和调休名称；年度位图接口仍作为
+// 日期格子反显的主数据源，名称接口失败时仪表盘会自动回退到周末/工作日。
+constexpr char kHolidayNameCalendarBaseUrl[] = "https://unpkg.com/holiday-calendar/data/CN/";
+constexpr char kHolidayNameCalendarFallbackBaseUrl[] =
+    "https://raw.githubusercontent.com/cg-zhou/holiday-calendar/main/data/CN/";
 constexpr size_t kMaxHolidayCalendarBody = 16 * 1024;
 constexpr uint32_t kHolidayCalendarRefreshMs = 6 * 60 * 60 * 1000;
 constexpr uint32_t kHolidayCalendarRetryMs = 5 * 60 * 1000;
 constexpr size_t kMaxWeatherBody = 16 * 1024;
 constexpr size_t kMaxWeatherDecodedBody = 16 * 1024;
-constexpr uint32_t kWeatherRefreshMs = 30 * 60 * 1000;
+constexpr uint32_t kWeatherBatteryRefreshMs = 60 * 60 * 1000;
+constexpr uint32_t kWeatherExternalPowerRefreshMs = 60 * 1000;
 constexpr uint32_t kWeatherRetryMs = 5 * 60 * 1000;
 constexpr uint32_t kWeatherLocationRetryMs = 30 * 1000;
-constexpr uint32_t kWeatherLocationRefreshMs = 6 * 60 * 60 * 1000;
 constexpr uint32_t kNetworkWaitMs = 1000;
-// ipapi.co 的证书链在设备的 CRT bundle 中无法验证；ipinfo.io 已验证可用，
-// ip-api.com 作为不需要 TLS 的最后回退，避免定位流程被单个 HTTPS 源阻断。
-constexpr char kIpLocationUrl[] = "https://ipinfo.io/json";
-constexpr char kIpLocationFallbackUrl[] = "http://ip-api.com/json/?fields=status,city,lat,lon";
+// 使用用户指定的 uapis.cn 作为公网 IP 定位主来源。它同时返回 ip、region 和
+// latitude/longitude；ipinfo.io 仅作为主来源不可用时的回退。
+constexpr char kIpLocationUrl[] = "https://uapis.cn/api/v1/network/myip";
+constexpr char kIpLocationFallbackUrl[] = "https://ipinfo.io/json";
 
 // TLS setup, HTTP parsing and cJSON are all called from the same worker. The
 // default 6 KiB stack was exhausted immediately after the IP response was
@@ -197,7 +202,7 @@ bool FetchQWeatherResponse(const std::string& path, std::string& decoded) {
 
 bool FetchIpLocationResponse(std::string& decoded) {
     const char* const urls[] = {kIpLocationUrl, kIpLocationFallbackUrl};
-    const char* const names[] = {"IP location", "IP location fallback"};
+    const char* const names[] = {"IP location (uapis.cn)", "IP location fallback (ipinfo)"};
     for (size_t index = 0; index < sizeof(urls) / sizeof(urls[0]); ++index) {
         if (FetchHttpResponse(urls[index], "xiaozhi-rlcd-ip-location/1.0", nullptr, names[index], decoded)) {
             return true;
@@ -222,11 +227,174 @@ bool JsonNumberText(cJSON* item, std::string& text) {
     return false;
 }
 
+std::string JsonStringOr(cJSON* item, const char* fallback) {
+    if (cJSON_IsString(item) && item->valuestring != nullptr && item->valuestring[0] != '\0') {
+        return item->valuestring;
+    }
+    return fallback != nullptr ? fallback : "";
+}
+
+std::string LastRegionComponent(const std::string& region) {
+    std::string value = TrimWhitespace(region);
+    if (value.empty()) return {};
+
+    const size_t separator = value.find_last_of(" \t\r\n");
+    if (separator != std::string::npos) value = TrimWhitespace(value.substr(separator + 1));
+    return value;
+}
+
+bool ParseHolidayCalendarNote(const std::string& body, int year, int month, int day, std::string& note) {
+    note.clear();
+    cJSON* root = cJSON_Parse(body.c_str());
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    cJSON* dates = cJSON_GetObjectItem(root, "dates");
+    if (!cJSON_IsArray(dates)) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    std::string date_buf = std::to_string(year) + "-";
+    if (month < 10) date_buf += '0';
+    date_buf += std::to_string(month) + "-";
+    if (day < 10) date_buf += '0';
+    date_buf += std::to_string(day);
+    cJSON* item = nullptr;
+    cJSON_ArrayForEach(item, dates) {
+        if (!cJSON_IsObject(item)) continue;
+        const std::string date = JsonStringOr(cJSON_GetObjectItem(item, "date"), "");
+        if (date != date_buf) continue;
+
+        note = JsonStringOr(cJSON_GetObjectItem(item, "name_cn"), "");
+        if (note.empty()) note = JsonStringOr(cJSON_GetObjectItem(item, "name"), "");
+        break;
+    }
+    cJSON_Delete(root);
+    return true;
+}
+
+double JsonDoubleOr(cJSON* item, double fallback) {
+    if (cJSON_IsNumber(item)) return item->valuedouble;
+    if (cJSON_IsString(item) && item->valuestring != nullptr && item->valuestring[0] != '\0') {
+        char* end = nullptr;
+        const double value = std::strtod(item->valuestring, &end);
+        if (end != item->valuestring && end != nullptr && *end == '\0') return value;
+    }
+    return fallback;
+}
+
+std::string AlertColorText(const std::string& color) {
+    if (color == "blue") return "蓝色";
+    if (color == "yellow") return "黄色";
+    if (color == "orange") return "橙色";
+    if (color == "red") return "红色";
+    if (color == "purple") return "紫色";
+    if (color == "green") return "绿色";
+    if (color == "black") return "黑色";
+    if (color == "white") return "白色";
+    if (color == "gray") return "灰色";
+    return color;
+}
+
+std::string CombineWeatherNotices(const std::string& alert, const std::string& precipitation) {
+    if (alert.empty() && precipitation.empty()) return {};
+    // Always reserve two visual rows: alert on the first row and minutely
+    // precipitation on the second. The dashboard layout turns this delimiter
+    // into two independent single-line scrolling labels.
+    return alert + "\n" + precipitation;
+}
+
+std::string ParseMinutelyNotice(cJSON* root) {
+    if (!cJSON_IsObject(root)) return {};
+    cJSON* code = cJSON_GetObjectItem(root, "code");
+    if (!cJSON_IsString(code) || code->valuestring == nullptr || std::strcmp(code->valuestring, "200") != 0) {
+        return {};
+    }
+    cJSON* minutely = cJSON_GetObjectItem(root, "minutely");
+    if (!cJSON_IsArray(minutely)) return {};
+
+    bool has_precipitation = false;
+    cJSON* item = nullptr;
+    cJSON_ArrayForEach(item, minutely) {
+        if (JsonDoubleOr(cJSON_GetObjectItem(item, "precip"), 0.0) > 0.0001) {
+            has_precipitation = true;
+            break;
+        }
+    }
+    if (!has_precipitation) return {};
+
+    const std::string summary = TrimWhitespace(JsonStringOr(cJSON_GetObjectItem(root, "summary"), ""));
+    return summary.empty() ? "未来两小时有降水" : summary;
+}
+
+std::string ParseAlertNotice(cJSON* root) {
+    if (!cJSON_IsObject(root)) return {};
+    cJSON* alerts = cJSON_GetObjectItem(root, "alerts");
+    const bool legacy_warning_api = !cJSON_IsArray(alerts);
+    if (legacy_warning_api) alerts = cJSON_GetObjectItem(root, "warning");
+    if (!cJSON_IsArray(alerts)) return {};
+
+    cJSON* alert = nullptr;
+    cJSON_ArrayForEach(alert, alerts) {
+        if (legacy_warning_api) {
+            const std::string status = JsonStringOr(cJSON_GetObjectItem(alert, "status"), "active");
+            if (status == "cancel" || status == "expired" || status == "past") continue;
+            const std::string type_name = JsonStringOr(cJSON_GetObjectItem(alert, "typeName"), "");
+            const std::string level = JsonStringOr(cJSON_GetObjectItem(alert, "level"), "");
+            if (!type_name.empty()) {
+                return "预警 " + type_name + level + "预警";
+            }
+            const std::string title = TrimWhitespace(JsonStringOr(cJSON_GetObjectItem(alert, "title"), ""));
+            if (!title.empty()) return "预警 " + title;
+            continue;
+        }
+
+        cJSON* message_type = cJSON_GetObjectItem(alert, "messageType");
+        const std::string message_type_code = JsonStringOr(
+            message_type != nullptr ? cJSON_GetObjectItem(message_type, "code") : nullptr, "");
+        if (message_type_code == "cancel") continue;
+
+        cJSON* event_type = cJSON_GetObjectItem(alert, "eventType");
+        const std::string event_name = JsonStringOr(
+            event_type != nullptr ? cJSON_GetObjectItem(event_type, "name") : nullptr, "");
+        const std::string color = AlertColorText(JsonStringOr(
+            cJSON_GetObjectItem(alert, "color") != nullptr
+                ? cJSON_GetObjectItem(cJSON_GetObjectItem(alert, "color"), "code")
+                : nullptr,
+            ""));
+        if (!event_name.empty()) {
+            std::string notice = "预警 " + event_name;
+            if (!color.empty()) notice += color + "预警";
+            return notice;
+        }
+
+        const std::string headline = TrimWhitespace(JsonStringOr(cJSON_GetObjectItem(alert, "headline"), ""));
+        if (!headline.empty()) return "预警 " + headline;
+    }
+    return {};
+}
+
 bool IsCoordinate(const std::string& text, double minimum, double maximum) {
     if (text.empty()) return false;
     char* end = nullptr;
     const double value = std::strtod(text.c_str(), &end);
     return end != text.c_str() && end != nullptr && *end == '\0' && value >= minimum && value <= maximum;
+}
+
+bool ParseLongitudeLatitude(const std::string& text, std::string& longitude, std::string& latitude) {
+    const size_t separator = text.find(',');
+    if (separator == std::string::npos) return false;
+    const std::string parsed_longitude = TrimWhitespace(text.substr(0, separator));
+    const std::string parsed_latitude = TrimWhitespace(text.substr(separator + 1));
+    if (!IsCoordinate(parsed_longitude, -180.0, 180.0) || !IsCoordinate(parsed_latitude, -90.0, 90.0)) {
+        return false;
+    }
+    longitude = parsed_longitude;
+    latitude = parsed_latitude;
+    return true;
 }
 
 bool ParseIpInfoLocation(cJSON* item, std::string& latitude, std::string& longitude) {
@@ -591,7 +759,15 @@ void CustomLcdDisplay::SetupDashboard() {
     weather_location_ = CONFIG_RLCD_QWEATHER_LOCATION;
     weather_city_ = CONFIG_RLCD_QWEATHER_CITY;
     weather_location_manual_ = !weather_location_.empty();
-    weather_location_ready_ = weather_location_manual_;
+    weather_location_ready_ = false;
+    if (weather_location_manual_) {
+        std::string longitude;
+        std::string latitude;
+        if (ParseLongitudeLatitude(weather_location_, longitude, latitude)) {
+            weather_coordinates_ = longitude + "," + latitude;
+            weather_location_ready_ = true;
+        }
+    }
 
     // 创建 ESP 专属的时钟定时器（1 秒周期）
     esp_timer_create_args_t clock_timer_args = {
@@ -646,24 +822,39 @@ void CustomLcdDisplay::HolidayCalendarTask(void* arg) {
         const bool weather_configured = CONFIG_RLCD_QWEATHER_API_HOST[0] != '\0' &&
                                         CONFIG_RLCD_QWEATHER_API_KEY[0] != '\0';
         if (weather_configured) {
+            // Resolve the public-IP location once at startup. Further changes
+            // are explicitly requested by the AI MCP tool; do not poll the
+            // geolocation providers on a timer.
+            const bool location_requested = self->weather_location_refresh_requested_.load();
             const bool location_due = !self->weather_location_ready_ ||
-                                       (!self->weather_location_manual_ && static_cast<int32_t>(now - next_location) >= 0);
-            if (location_due) {
+                                      (!self->weather_location_manual_ && location_requested);
+            if (location_due && (location_requested || static_cast<int32_t>(now - next_location) >= 0)) {
                 const bool resolved = self->ResolveWeatherLocation();
-                next_location = xTaskGetTickCount() +
-                                pdMS_TO_TICKS(resolved ? kWeatherLocationRefreshMs : kWeatherLocationRetryMs);
-                if (resolved) next_weather = xTaskGetTickCount();
+                next_location = xTaskGetTickCount() + pdMS_TO_TICKS(kWeatherLocationRetryMs);
+                if (resolved) {
+                    self->weather_location_refresh_requested_.store(false);
+                    next_weather = xTaskGetTickCount();
+                }
             }
 
             now = xTaskGetTickCount();
             if (self->weather_location_ready_ && static_cast<int32_t>(now - next_weather) >= 0) {
                 const bool fetched = self->FetchWeather();
-                next_weather = xTaskGetTickCount() + pdMS_TO_TICKS(fetched ? kWeatherRefreshMs : kWeatherRetryMs);
+                int battery_level = 0;
+                bool charging = false;
+                bool discharging = false;
+                const bool power_state_known =
+                    Board::GetInstance().GetBatteryLevel(battery_level, charging, discharging);
+                const bool external_power = power_state_known && (charging || !discharging);
+                const uint32_t refresh_ms = external_power ? kWeatherExternalPowerRefreshMs
+                                                            : kWeatherBatteryRefreshMs;
+                next_weather = xTaskGetTickCount() +
+                               pdMS_TO_TICKS(fetched ? refresh_ms : kWeatherRetryMs);
             }
         } else if (!weather_configured) {
             // Do not busy-loop when the optional API key is intentionally absent.
-            next_location = now + pdMS_TO_TICKS(kWeatherRefreshMs);
-            next_weather = now + pdMS_TO_TICKS(kWeatherRefreshMs);
+            next_location = now + pdMS_TO_TICKS(kWeatherBatteryRefreshMs);
+            next_weather = now + pdMS_TO_TICKS(kWeatherBatteryRefreshMs);
         }
 
         now = xTaskGetTickCount();
@@ -676,10 +867,15 @@ void CustomLcdDisplay::HolidayCalendarTask(void* arg) {
         if (self->holiday_task_stop_.load()) break;
         now = xTaskGetTickCount();
         const TickType_t holiday_wait = next_holiday - now;
-        const TickType_t location_wait = next_location - now;
         const TickType_t weather_wait = next_weather - now;
-        TickType_t wait_ticks = holiday_wait < location_wait ? holiday_wait : location_wait;
+        TickType_t wait_ticks = holiday_wait;
         if (weather_wait < wait_ticks) wait_ticks = weather_wait;
+        if (weather_configured &&
+            (!self->weather_location_ready_ ||
+             (!self->weather_location_manual_ && self->weather_location_refresh_requested_.load()))) {
+            const TickType_t location_wait = next_location - now;
+            if (location_wait < wait_ticks) wait_ticks = location_wait;
+        }
         ulTaskNotifyTake(pdTRUE, wait_ticks);
     }
     self->holiday_task_running_ = false;
@@ -741,13 +937,38 @@ bool CustomLcdDisplay::FetchHolidayCalendar() {
     }
 
     const unsigned flag_count = static_cast<unsigned>(flags.size());
+
+    // 名称数据是可选增强：年度位图成功后即使 CDN 暂时不可用，日历黑底和
+    // “周末/工作日”兜底仍然正常显示。
+    std::string holiday_note;
+    bool holiday_note_fetched = false;
+    const int month = timeinfo.tm_mon + 1;
+    const int day = timeinfo.tm_mday;
+    const int day_of_year = timeinfo.tm_yday + 1;
+    const std::string year_suffix = std::to_string(year) + ".json";
+    std::string name_body;
+    std::string name_url = kHolidayNameCalendarBaseUrl + year_suffix;
+    if (FetchHttpResponse(name_url.c_str(), "xiaozhi-rlcd-holiday-names/1.0", nullptr, "Holiday names", name_body) ||
+        (name_url = kHolidayNameCalendarFallbackBaseUrl + year_suffix,
+         FetchHttpResponse(name_url.c_str(), "xiaozhi-rlcd-holiday-names/1.0", nullptr,
+                           "Holiday names fallback", name_body))) {
+        holiday_note_fetched = ParseHolidayCalendarNote(name_body, year, month, day, holiday_note);
+    }
+
     {
         std::lock_guard<std::mutex> lock(holiday_mutex_);
         pending_holiday_year_ = year;
         pending_holiday_flags_ = std::move(flags);
         pending_holiday_ready_ = true;
+        if (holiday_note_fetched) {
+            pending_holiday_note_year_ = year;
+            pending_holiday_note_day_of_year_ = day_of_year;
+            pending_holiday_note_ = std::move(holiday_note);
+            pending_holiday_note_ready_ = true;
+        }
     }
-    ESP_LOGI(TAG, "Holiday calendar fetched for %d (%u days)", year, flag_count);
+    ESP_LOGI(TAG, "Holiday calendar fetched for %d (%u days)%s", year, flag_count,
+             holiday_note_fetched ? ", today name resolved" : ", today name unavailable");
     return true;
 }
 
@@ -755,7 +976,43 @@ bool CustomLcdDisplay::ResolveWeatherLocation() {
     // 保留一个显式配置入口，便于没有公网 IP 定位服务时手动指定位置；默认配置为空，
     // 正常路径始终根据当前网络重新定位，不把任何城市写死在固件中。
     if (weather_location_manual_) {
-        weather_location_ready_ = !weather_location_.empty();
+        if (weather_location_.empty()) return false;
+        // Minutely precipitation and alerts need coordinates even when the
+        // user configured a QWeather city Location ID. Resolve them once via
+        // GeoAPI, while keeping the configured ID for the regular weather API.
+        if (weather_coordinates_.empty()) {
+            std::string geo_json;
+            std::string geo_path = "/geo/v2/city/lookup?location=";
+            geo_path += weather_location_;
+            geo_path += "&lang=zh&number=1";
+            if (FetchQWeatherResponse(geo_path, geo_json)) {
+                cJSON* geo_root = cJSON_Parse(geo_json.c_str());
+                cJSON* locations = geo_root != nullptr ? cJSON_GetObjectItem(geo_root, "location") : nullptr;
+                cJSON* location = cJSON_IsArray(locations) ? cJSON_GetArrayItem(locations, 0) : nullptr;
+                std::string latitude;
+                std::string longitude;
+                if (cJSON_IsObject(location) &&
+                    JsonNumberText(cJSON_GetObjectItem(location, "lat"), latitude) &&
+                    JsonNumberText(cJSON_GetObjectItem(location, "lon"), longitude) &&
+                    IsCoordinate(latitude, -90.0, 90.0) && IsCoordinate(longitude, -180.0, 180.0)) {
+                    weather_coordinates_ = longitude + "," + latitude;
+                    if (weather_city_.empty()) {
+                        weather_city_ = JsonStringOr(cJSON_GetObjectItem(location, "adm2"), "");
+                        if (weather_city_.empty()) {
+                            weather_city_ = JsonStringOr(cJSON_GetObjectItem(location, "name"), "");
+                        }
+                    }
+                }
+                cJSON_Delete(geo_root);
+            }
+        }
+        weather_location_ready_ = true;
+        if (weather_city_.empty()) weather_city_ = "定位中";
+        if (weather_city_ != "定位中") {
+            std::lock_guard<std::mutex> lock(holiday_mutex_);
+            pending_weather_city_only_ = weather_city_;
+            pending_weather_city_only_ready_ = true;
+        }
         return weather_location_ready_;
     }
 
@@ -782,8 +1039,8 @@ bool CustomLcdDisplay::ResolveWeatherLocation() {
         has_longitude = JsonNumberText(cJSON_GetObjectItem(ip_root, "lon"), longitude);
     }
     // ipinfo.io exposes the same coordinates as a single "loc": "lat,lon"
-    // field.  Accept it so a rate-limited ipapi/ipwho response does not leave
-    // the dashboard in its initial state.
+    // field. Accept it so the fallback response does not leave the dashboard
+    // in its initial state.
     if (!has_latitude || !has_longitude) {
         latitude.clear();
         longitude.clear();
@@ -795,10 +1052,21 @@ bool CustomLcdDisplay::ResolveWeatherLocation() {
     std::string ip_city = cJSON_IsString(ip_city_item) && ip_city_item->valuestring != nullptr
                               ? TrimWhitespace(ip_city_item->valuestring)
                               : std::string();
+    // uapis.cn/ipinfo.io both use "ip". Keep "query" for compatibility with
+    // older ip-api responses that may still be returned by a local proxy.
     cJSON* ip_address_item = cJSON_GetObjectItem(ip_root, "ip");
+    if (!cJSON_IsString(ip_address_item) || ip_address_item->valuestring == nullptr) {
+        ip_address_item = cJSON_GetObjectItem(ip_root, "query");
+    }
     std::string ip_address = cJSON_IsString(ip_address_item) && ip_address_item->valuestring != nullptr
                                  ? TrimWhitespace(ip_address_item->valuestring)
                                  : std::string();
+    if (ip_city.empty()) {
+        cJSON* region_item = cJSON_GetObjectItem(ip_root, "region");
+        if (cJSON_IsString(region_item) && region_item->valuestring != nullptr) {
+            ip_city = LastRegionComponent(region_item->valuestring);
+        }
+    }
     cJSON_Delete(ip_root);
 
     if (!has_latitude || !has_longitude || !IsCoordinate(latitude, -90.0, 90.0) ||
@@ -819,7 +1087,12 @@ bool CustomLcdDisplay::ResolveWeatherLocation() {
     geo_path += "&lang=zh&number=1";
 
     std::string resolved_location = coordinate;
+    // Keep the city supplied by the IP provider when it is available. The
+    // QWeather GeoAPI response is used to obtain its stable Location ID, but
+    // it may map an approximate public-IP coordinate to a neighboring city
+    // and should not silently replace the provider's city label.
     std::string resolved_city = ip_city;
+    std::string qweather_city;
     if (FetchQWeatherResponse(geo_path, geo_json)) {
         cJSON* geo_root = cJSON_Parse(geo_json.c_str());
         if (geo_root != nullptr) {
@@ -836,10 +1109,16 @@ bool CustomLcdDisplay::ResolveWeatherLocation() {
                 resolved_location = location_id->valuestring;
                 if (cJSON_IsString(location_adm2) && location_adm2->valuestring != nullptr &&
                     location_adm2->valuestring[0] != '\0') {
-                    resolved_city = location_adm2->valuestring;
+                    qweather_city = location_adm2->valuestring;
                 } else if (cJSON_IsString(location_name) && location_name->valuestring != nullptr &&
                            location_name->valuestring[0] != '\0') {
-                    resolved_city = location_name->valuestring;
+                    qweather_city = location_name->valuestring;
+                }
+                if (resolved_city.empty()) {
+                    resolved_city = qweather_city;
+                } else if (!qweather_city.empty() && qweather_city != resolved_city) {
+                    ESP_LOGW(TAG, "IP/QWeather city mismatch: ip=%s qweather=%s; keeping IP city",
+                             resolved_city.c_str(), qweather_city.c_str());
                 }
             } else {
                 ESP_LOGW(TAG, "QWeather GeoAPI returned no matching city; using coordinates");
@@ -848,9 +1127,12 @@ bool CustomLcdDisplay::ResolveWeatherLocation() {
         }
     }
 
+    weather_coordinates_ = coordinate;
     weather_location_ = std::move(resolved_location);
     weather_city_ = CONFIG_RLCD_QWEATHER_CITY[0] != '\0' ? CONFIG_RLCD_QWEATHER_CITY : resolved_city;
     if (weather_city_.empty()) weather_city_ = "定位中";
+    weather_precipitation_notice_.clear();
+    weather_alert_notice_.clear();
     weather_location_ready_ = true;
     if (weather_city_ != "定位中") {
         std::lock_guard<std::mutex> lock(holiday_mutex_);
@@ -858,6 +1140,69 @@ bool CustomLcdDisplay::ResolveWeatherLocation() {
         pending_weather_city_only_ready_ = true;
     }
     ESP_LOGI(TAG, "Weather location resolved: %s (%s)", weather_city_.c_str(), weather_location_.c_str());
+    return true;
+}
+
+bool CustomLcdDisplay::FetchWeatherNotices() {
+    std::string longitude;
+    std::string latitude;
+    if (!ParseLongitudeLatitude(weather_coordinates_, longitude, latitude)) return false;
+
+    bool notice_updated = false;
+
+    std::string minutely_json;
+    std::string minutely_path = "/v7/minutely/5m?location=";
+    minutely_path += weather_coordinates_;
+    minutely_path += "&lang=zh";
+    if (FetchQWeatherResponse(minutely_path, minutely_json)) {
+        cJSON* minutely_root = cJSON_Parse(minutely_json.c_str());
+        cJSON* minutely_code = minutely_root != nullptr ? cJSON_GetObjectItem(minutely_root, "code") : nullptr;
+        cJSON* minutely_data = minutely_root != nullptr ? cJSON_GetObjectItem(minutely_root, "minutely") : nullptr;
+        if (cJSON_IsString(minutely_code) && minutely_code->valuestring != nullptr &&
+            std::strcmp(minutely_code->valuestring, "200") == 0 && cJSON_IsArray(minutely_data)) {
+            weather_precipitation_notice_ = ParseMinutelyNotice(minutely_root);
+            notice_updated = true;
+        }
+        cJSON_Delete(minutely_root);
+    }
+
+    std::string alert_json;
+    // The configured free API key is currently served by the v7 host. Use its
+    // warning endpoint first; fall back to the newer v1 path for custom API
+    // hosts that have already migrated.
+    std::string alert_path = "/v7/warning/now?location=";
+    alert_path += weather_location_;
+    alert_path += "&lang=zh";
+    bool alert_request_ok = FetchQWeatherResponse(alert_path, alert_json);
+    if (!alert_request_ok) {
+        alert_json.clear();
+        alert_path = "/weatheralert/v1/current/";
+        alert_path += latitude;
+        alert_path += ",";
+        alert_path += longitude;
+        alert_path += "?localTime=true&lang=zh";
+        alert_request_ok = FetchQWeatherResponse(alert_path, alert_json);
+    }
+    if (alert_request_ok) {
+        cJSON* alert_root = cJSON_Parse(alert_json.c_str());
+        cJSON* alert_code = alert_root != nullptr ? cJSON_GetObjectItem(alert_root, "code") : nullptr;
+        cJSON* alerts = alert_root != nullptr ? cJSON_GetObjectItem(alert_root, "alerts") : nullptr;
+        cJSON* legacy_warning = alert_root != nullptr ? cJSON_GetObjectItem(alert_root, "warning") : nullptr;
+        cJSON* metadata = alert_root != nullptr ? cJSON_GetObjectItem(alert_root, "metadata") : nullptr;
+        cJSON* zero_result = metadata != nullptr ? cJSON_GetObjectItem(metadata, "zeroResult") : nullptr;
+        const bool code_ok = cJSON_IsString(alert_code) && alert_code->valuestring != nullptr &&
+                             std::strcmp(alert_code->valuestring, "200") == 0;
+        const bool valid_alert_response = (code_ok && (cJSON_IsArray(alerts) || cJSON_IsArray(legacy_warning))) ||
+                                          cJSON_IsBool(zero_result);
+        if (valid_alert_response) {
+            weather_alert_notice_ = ParseAlertNotice(alert_root);
+            notice_updated = true;
+        }
+        cJSON_Delete(alert_root);
+    }
+
+    if (!notice_updated) return false;
+    weather_notice_ = CombineWeatherNotices(weather_alert_notice_, weather_precipitation_notice_);
     return true;
 }
 
@@ -931,6 +1276,10 @@ bool CustomLcdDisplay::FetchWeather() {
     cJSON_Delete(now_root);
     cJSON_Delete(forecast_root);
 
+    // These endpoints are optional enrichments. A transient failure keeps the
+    // last known notice instead of replacing a still-valid warning with blank.
+    FetchWeatherNotices();
+
     {
         std::lock_guard<std::mutex> lock(holiday_mutex_);
         pending_weather_city_ = std::move(display_city);
@@ -939,6 +1288,7 @@ bool CustomLcdDisplay::FetchWeather() {
         pending_weather_high_temperature_ = std::move(display_high_temperature);
         pending_weather_low_temperature_ = std::move(display_low_temperature);
         pending_weather_description_ = std::move(display_description);
+        pending_weather_notice_ = weather_notice_;
         pending_weather_ready_ = true;
     }
     ESP_LOGI(TAG, "QWeather current and daily weather fetched for %s", weather_location_.c_str());
@@ -948,14 +1298,19 @@ bool CustomLcdDisplay::FetchWeather() {
 void CustomLcdDisplay::ApplyPendingDashboardData() {
     std::string flags;
     int year = 0;
+    std::string holiday_note;
+    int holiday_note_year = 0;
+    int holiday_note_day_of_year = 0;
     std::string city;
     std::string temperature;
     std::string feels_like;
     std::string high_temperature;
     std::string low_temperature;
     std::string description;
+    std::string notice;
     std::string city_only;
     bool apply_holiday = false;
+    bool apply_holiday_note = false;
     bool apply_city_only = false;
     bool apply_weather = false;
     {
@@ -966,6 +1321,13 @@ void CustomLcdDisplay::ApplyPendingDashboardData() {
             pending_holiday_ready_ = false;
             apply_holiday = true;
         }
+        if (pending_holiday_note_ready_) {
+            holiday_note_year = pending_holiday_note_year_;
+            holiday_note_day_of_year = pending_holiday_note_day_of_year_;
+            holiday_note = std::move(pending_holiday_note_);
+            pending_holiday_note_ready_ = false;
+            apply_holiday_note = true;
+        }
         if (pending_weather_ready_) {
             city = std::move(pending_weather_city_);
             temperature = std::move(pending_weather_temperature_);
@@ -973,6 +1335,7 @@ void CustomLcdDisplay::ApplyPendingDashboardData() {
             high_temperature = std::move(pending_weather_high_temperature_);
             low_temperature = std::move(pending_weather_low_temperature_);
             description = std::move(pending_weather_description_);
+            notice = std::move(pending_weather_notice_);
             pending_weather_ready_ = false;
             apply_weather = true;
         }
@@ -986,12 +1349,18 @@ void CustomLcdDisplay::ApplyPendingDashboardData() {
     if (apply_holiday && dashboard_layout::SetHolidayCalendar(dashboard_state_, year, flags.c_str(), flags.size())) {
         ESP_LOGI(TAG, "Applied holiday calendar for %d", year);
     }
+    if (apply_holiday_note && dashboard_layout::SetHolidayNote(dashboard_state_, holiday_note_year,
+                                                                holiday_note_day_of_year, holiday_note.c_str())) {
+        ESP_LOGI(TAG, "Applied holiday note for %d day %d: %s", holiday_note_year, holiday_note_day_of_year,
+                 holiday_note.empty() ? "none" : holiday_note.c_str());
+    }
     if (apply_city_only) {
         dashboard_layout::SetWeatherCity(dashboard_state_, city_only.c_str());
     }
     if (apply_weather) {
         dashboard_layout::SetWeather(dashboard_state_, city.c_str(), temperature.c_str(), feels_like.c_str(),
-                                     high_temperature.c_str(), low_temperature.c_str(), description.c_str());
+                                     high_temperature.c_str(), low_temperature.c_str(), description.c_str(),
+                                     notice.c_str());
     }
 }
 
@@ -1007,6 +1376,25 @@ void CustomLcdDisplay::StopHolidayCalendarTask() {
     }
     holiday_task_running_ = false;
     holiday_task_ = nullptr;
+}
+
+bool CustomLcdDisplay::RequestWeatherLocationUpdate() {
+    if (CONFIG_RLCD_QWEATHER_API_HOST[0] == '\0' || CONFIG_RLCD_QWEATHER_API_KEY[0] == '\0') {
+        ESP_LOGW(TAG, "Weather location update unavailable because QWeather is not configured");
+        return false;
+    }
+    if (weather_location_manual_) {
+        ESP_LOGW(TAG, "Weather location is fixed by RLCD_QWEATHER_LOCATION; AI update ignored");
+        return false;
+    }
+    if (holiday_task_ == nullptr || !holiday_task_running_.load()) {
+        ESP_LOGW(TAG, "Weather location update unavailable because the weather worker is not running");
+        return false;
+    }
+    weather_location_refresh_requested_.store(true);
+    xTaskNotifyGive(holiday_task_);
+    ESP_LOGI(TAG, "Weather location update requested by AI");
+    return true;
 }
 
 void CustomLcdDisplay::ShowDashboard() {

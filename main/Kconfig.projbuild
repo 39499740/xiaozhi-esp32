@@ -609,7 +609,7 @@ menu "RLCD Dashboard Weather"
         string "QWeather Location ID"
         default ""
         help
-            Optional fixed QWeather Location ID or longitude,latitude pair. Leave empty to resolve the city from the public network IP; this can identify the carrier or NAT gateway rather than the device's physical city.
+            Optional fixed QWeather Location ID or longitude,latitude pair. Leave empty to resolve the city once from the public network IP at startup. Later location changes are requested by the AI weather-location tool; public-IP results can identify the carrier or NAT gateway rather than the device's physical city.
 
     config RLCD_QWEATHER_CITY
         string "Weather city display name"
